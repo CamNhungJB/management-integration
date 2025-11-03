@@ -1,0 +1,12 @@
+# Web framework
+Flask>=2.3
+
+# Gọi API HTTP
+requests>=2.30
+
+# Load bien môi trường từ .env
+python-dotenv>=1.0
+
+# MongoDB (nếu dùng save_to_mongo)
+pymongo>=4.5
+
