@@ -1,0 +1,376 @@
+from flask import Flask, jsonify, request, send_file
+from datetime import datetime, timezone
+from services.threatfox_service import process_threatfox
+from services.rule_generator import  publish_rules_to_mongo
+from services.db_service import get_all_rule_sets, mongo_to_json
+from dotenv import load_dotenv
+from services import db_service
+import json
+import config
+import os
+import threading
+import time
+from services import threatfox_service, abuseipdb_service
+from flask_pymongo import PyMongo
+from flask_cors import CORS
+load_dotenv()
+app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "http://100.100.100.100:3000"}})
+sensors = {}
+app.config["MONGO_URI"] = f"{config.MONGO_URI}/{config.MONGO_DB}"
+mongo = PyMongo(app)
+
+@app.route('/api/v1/rules/active_bundle', methods=['GET'])
+def get_active_rule_bundle():
+    try:
+        # 1️⃣ Lấy collection deployment_status
+        deploy_col = db_service.get_deployment_status_collection()
+
+        # 2️⃣ Truy vấn _id = "production_sensors"
+        deployment = deploy_col.find_one({"_id": "production_sensors"})
+        if not deployment or "active_rule_set_id" not in deployment:
+            return jsonify({"error": "Không tìm thấy active_rule_set_id"}), 404
+
+        active_id = deployment["active_rule_set_id"]
+
+        # 3️⃣ Lấy collection rules
+        rules_col = db_service.get_rules_collection()
+
+        # Nếu ID là ObjectId thì đảm bảo kiểu dữ liệu đúng
+        query_id = ObjectId(active_id) if isinstance(active_id, str) and len(active_id) == 24 else active_id
+
+        # 4️⃣ Truy vấn các rule có rule_set_id trùng khớp
+        rules_cursor = rules_col.find({"rule_set_id": query_id})
+        rules = list(rules_cursor)
+
+        if not rules:
+            return jsonify({"error": f"Không tìm thấy rule nào cho rule_set_id {active_id}"}), 404
+
+        # 5️⃣ Gộp nội dung rule
+        contents = [r.get("content", "") for r in rules]
+        bundle = "\n".join(contents)
+
+        # 6️⃣ Trả kết quả
+        return jsonify({
+            "active_rule_set_id": str(active_id),
+            "bundle": bundle
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/v1/deployment/status", methods=["GET"])
+def get_deployment_status():
+    try:
+        col = db_service.get_deployment_status_collection()
+        doc = col.find_one({"_id": config.DEPLOYMENT_ID})
+        if not doc:
+            return jsonify({"active_rule_set_id": None})
+        
+        return jsonify({
+            "active_rule_set_id": str(doc["active_rule_set_id"])
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/v1/sensors/heartbeat", methods=["POST"])
+def sensor_heartbeat():
+    try:
+        data = request.get_json(force=True)
+
+        # Kiểm tra dữ liệu bắt buộc
+        required_fields = ["sensor_id", "hostname", "ip_address", "current_rule_set_id"]
+        missing = [f for f in required_fields if f not in data]
+        if missing:
+            return jsonify({"error": f"Thiếu các trường bắt buộc: {', '.join(missing)}"}), 400
+
+        # Lấy collection sensors
+        sensors_col = db_service.get_sensors_collection()
+
+        # Cập nhật hoặc thêm mới sensor
+        result = sensors_col.update_one(
+            {"_id": data["sensor_id"]},
+            {
+                "$set": {
+                    "last_seen": datetime.utcnow(),
+                    "hostname": data["hostname"],
+                    "ip_address": data["ip_address"],
+                    "current_rule_set_id": data["current_rule_set_id"]
+                }
+            },
+            upsert=True
+        )
+
+        # Phản hồi
+        if result.upserted_id:
+            msg = f"Đã đăng ký sensor mới với ID {data['sensor_id']}"
+        else:
+            msg = f"Đã cập nhật trạng thái sensor {data['sensor_id']}"
+
+        return jsonify({"message": msg, "sensor_id": data["sensor_id"]}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/v1/rules/publish',  methods=['POST'])
+def publish_new_rules():
+    """
+    API 3: Dành cho Manager - Kích hoạt quá trình sinh và publish rule mới.
+    Đây là một tác vụ có thể chạy lâu.
+    """
+    try:
+        # Gọi hàm chính từ rule_generator
+        total_rules = publish_rules_to_mongo()
+        
+        if total_rules > 0:
+            return jsonify({
+                "status": "success",
+                "message": f"Successfully published a new rule set.",
+                "total_rules": total_rules
+            }), 201 # 201 Created
+        else:
+            return jsonify({
+                "status": "no_action",
+                "message": "Không có rule nào được sinh ra hoặc đã có lỗi xảy ra. Vui lòng kiểm tra log.",
+                "total_rules": 0
+            }), 200
+
+    except Exception as e:
+        app.logger.error(f"Error in /publish: {e}")
+        return jsonify({"error": f"Failed to publish rules: {str(e)}"}), 500
+@app.route("/api/v1/sensors", methods=["GET"])
+def list_sensors():
+    try:
+        sensors_col = db_service.get_sensors_collection()
+        rule_sets_col = db_service.get_rule_sets_collection()
+
+        sensors = list(sensors_col.find({}))
+        if not sensors:
+            return jsonify({"sensors": []}), 200
+
+        rule_sets = {str(rs["_id"]): rs for rs in rule_sets_col.find({})}
+
+        result = []
+        now = datetime.now(timezone.utc)
+
+        for s in sensors:
+            sid = s.get("_id")
+            rule_set_id = s.get("current_rule_set_id")
+
+            rule_info = rule_sets.get(str(rule_set_id))
+            rule_version = rule_info["version"] if rule_info else "unknown"
+
+            # --- FIX QUAN TRỌNG: convert last_seen → UTC-aware ---
+            last_seen = s.get("last_seen")
+            if isinstance(last_seen, datetime):
+                if last_seen.tzinfo is None:  
+                    # MongoDB lưu datetime dạng naive → thêm UTC cho hợp lệ
+                    last_seen = last_seen.replace(tzinfo=timezone.utc)
+
+                diff = (now - last_seen).total_seconds()
+                status = "online" if diff < 600 else "offline"
+            else:
+                status = "unknown"
+
+            result.append({
+                "sensor_id": sid,
+                "hostname": s.get("hostname", ""),
+                "ip_address": s.get("ip_address", ""),
+                "current_rule_set_id": str(rule_set_id),
+                "rule_version": rule_version,
+                "last_seen": last_seen.isoformat() if isinstance(last_seen, datetime) else last_seen,
+                "status": status
+            })
+
+        return jsonify({"sensors": result}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/v1/rulesets', methods=['GET'])
+def get_rulesets_history():
+    """
+    API 5: Dành cho Manager - Lấy lịch sử các phiên bản rule đã được publish.
+    """
+    try:
+        rule_sets = get_all_rule_sets()
+        return jsonify(mongo_to_json(rule_sets))
+    except Exception as e:
+        app.logger.error(f"Error in /rulesets: {e}")
+        return jsonify({"error": "An internal server error occurred"}), 500
+
+@app.route('/api/v1/deployment/activate', methods=['POST'])
+def activate_rule_set():
+    """
+    API 6: Dành cho Manager - Rollback, kích hoạt một phiên bản rule cũ.
+    """
+    data = request.get_json()
+    rule_set_id_str = data.get("rule_set_id")
+
+    if not rule_set_id_str:
+        return jsonify({"error": "Yêu cầu thiếu 'rule_set_id'"}), 400
+
+    try:
+        # Chuyển đổi string sang ObjectId để truy vấn
+        rule_set_id = ObjectId(rule_set_id_str)
+        
+        # Kiểm tra xem rule_set_id này có thực sự tồn tại không
+        if not db_service.get_rule_set_by_id(rule_set_id):
+            return jsonify({"error": "Rule set with this ID does not exist"}), 404
+
+        # Kích hoạt phiên bản này
+        db_service.set_active_rule_set(rule_set_id)
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Successfully activated rule set ID: {rule_set_id_str}"
+        })
+    except Exception as e:
+        app.logger.error(f"Error in /deployment/activate: {e}")
+        return jsonify({"error": f"Invalid ID format or failed to activate: {str(e)}"}), 500
+@app.route("/rules", methods=["GET"])
+def get_rules():
+    collection = mongo.db[config.MONGO_COL_RULES]
+    rules = list(collection.find({}, {"_id": 0}))
+    return jsonify({"status": "success", "data": rules})
+def cleanup_old_rule_sets():
+    rule_sets = mongo.db[config.MONGO_COL_RULE_SETS]
+    rules = mongo.db[config.MONGO_COL_RULES]
+
+    all_sets = list(rule_sets.find().sort("created_at", -1))
+
+    if len(all_sets) <= 2:
+        return
+
+    to_delete = all_sets[2:]
+
+    for rs in to_delete:
+        rs_id = rs["_id"]
+        print(f"Xoá rule_set cũ: {rs_id}")
+
+        rule_sets.delete_one({"_id": rs_id})
+        deleted = rules.delete_many({"rule_set_id": rs_id})
+        print(f" - Đã xoá {deleted.deleted_count} rule thuộc rule_set đó")
+
+
+def background_data_updater():
+    """
+    Tự động:
+      - Kiểm tra nếu đã đủ N ngày kể từ lần cập nhật cuối
+      - Fetch ThreatFox + AbuseIPDB
+      - Sinh rule mới → publish lên MongoDB
+      - Ghi nhận phiên bản Rule Set mới
+      - Cập nhật deployment_status.active_rule_set_id
+      - Cleanup: chỉ giữ 2 phiên bản gần nhất
+    """
+
+    DAYS = 2
+    INTERVAL = 24 * 60 * 60  # kiểm tra lại mỗi 24 giờ
+
+    while True:
+        try:
+            status_col = mongo.db["system_status"]
+            now = datetime.utcnow()
+
+            # --- Lấy thời điểm update cuối ---
+            status = status_col.find_one({"_id": "rule_update_status"})
+            last_update = status["last_update"] if status else None
+
+            # --- Kiểm tra có cần update không ---
+            need_update = (
+                last_update is None or
+                (now - last_update).total_seconds() >= DAYS * 24 * 3600
+            )
+
+            if need_update:
+                print("🚀 BẮT ĐẦU cập nhật ThreatFox + AbuseIPDB + sinh Rule Set mới")
+
+                # ===============================
+                # 1) ThreatFox UPDATE
+                # ===============================
+                try:
+                    threatfox_result = threatfox_service.process_threatfox()
+                    print(f"✓ ThreatFox inserted {threatfox_result.get('inserted', '?')} IOCs")
+                except Exception as e:
+                    print("[X] Lỗi ThreatFox:", e)
+
+                # ===============================
+                # 2) AbuseIPDB UPDATE
+                # ===============================
+                try:
+                    file_path = abuseipdb_service.save_ips_to_file()
+                    print(f"✓ AbuseIPDB blacklist saved → {file_path}")
+                except Exception as e:
+                    print("[X] Lỗi AbuseIPDB:", e)
+
+                # ===============================
+                # 3) Sinh Rule Set mới
+                # ===============================
+                try:
+                    from services.rule_generator import publish_rules_to_mongo
+                    result = publish_rules_to_mongo()
+
+                    # publish_rules_to_mongo() phải trả về dict
+                    if isinstance(result, dict):
+                        rule_set_id = result["rule_set_id"]
+                        version = result["version"]
+                        total = result["total_rules"]
+
+                        print(f"🔥 ĐÃ TẠO RULE SET MỚI:")
+                        print(f"   Version     : {version}")
+                        print(f"   RuleSet ID  : {rule_set_id}")
+                        print(f"   Total Rules : {total}")
+
+                        # --- Ghi phiên bản active mới vào deployment_status ---
+                        deploy_col = mongo.db[config.MONGO_COL_DEPLOYMENT]
+                        deploy_col.update_one(
+                            {"_id": config.DEPLOYMENT_ID},
+                            {"$set": {"active_rule_set_id": rule_set_id}},
+                            upsert=True
+                        )
+
+                        print("📌 Đã cập nhật active_rule_set_id trong deployment_status")
+
+                    else:
+                        print("[X] publish_rules_to_mongo() trả về sai format!")
+
+                except Exception as e:
+                    print("[X] Lỗi sinh rule mới:", e)
+
+                # ===============================
+                # 4) Cleanup phiên bản cũ
+                # ===============================
+                try:
+                    cleanup_old_rule_sets()
+                    print("🧹 Đã cleanup rule_set cũ (giữ lại 2 bản mới nhất)")
+                except Exception as e:
+                    print("[X] Lỗi cleanup:", e)
+
+                # ===============================
+                # 5) Update mốc thời gian update
+                # ===============================
+                status_col.update_one(
+                    {"_id": "rule_update_status"},
+                    {"$set": {"last_update": now}},
+                    upsert=True
+                )
+
+                print("✓ HOÀN TẤT UPDATE + CLEANUP!\n")
+
+            else:
+                remain = DAYS * 24 * 3600 - (now - last_update).total_seconds()
+                hours = remain // 3600
+                print(f"⏳ Chưa đủ {DAYS} ngày — bật lại sau {hours} giờ.")
+
+        except Exception as e:
+            print("[!!!] LỖI BACKGROUND:", e)
+
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    updater_thread = threading.Thread(target=background_data_updater, daemon=True)
+    updater_thread.start()
+    print("[🚀] Flask app & background updater đã khởi động!")
+    app.run(host="0.0.0.0", port=5000)

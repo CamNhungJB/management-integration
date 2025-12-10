@@ -167,3 +167,27 @@ def save_to_mongo(entry):
         {"$set": doc},
         upsert=True
     )
+def get_all_rule_sets():
+    """
+    Lấy toàn bộ rule set đã publish, sort theo timestamp giảm dần.
+    """
+    col = get_rule_sets_collection()
+    return list(col.find({}).sort("timestamp", -1))
+
+
+def mongo_to_json(data):
+    """
+    Convert document MongoDB (ObjectId, datetime) thành JSON serializable.
+    """
+    result = []
+    for item in data:
+        converted = {}
+        for key, value in item.items():
+            if key in ("_id", "rule_set_id"):   # <── FIX QUAN TRỌNG
+                converted[key] = str(value)
+            elif isinstance(value, datetime):
+                converted[key] = value.isoformat()
+            else:
+                converted[key] = value
+        result.append(converted)
+    return result

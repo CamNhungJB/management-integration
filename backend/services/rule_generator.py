@@ -125,7 +125,12 @@ def publish_rules_to_mongo():
         set_active_rule_set(new_set_id)
 
         print(f"[✓] HOÀN TẤT: Đã publish thành công Rule Set '{version_name}' (ID: {new_set_id})")
-        return total_rules
+
+        return {
+            "rule_set_id": str(new_set_id),
+            "version": version_name,
+            "total_rules": total_rules
+        }
 
     except Exception as e:
         print(f"[!!!] LỖI NGHIÊM TRỌNG khi publish lên MongoDB: {e}")
