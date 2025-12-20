@@ -1,0 +1,25 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+
+# Virtual environments
+venv/
+.venv/
+backend/venv/
+
+# Python build
+build/
+dist/
+*.egg-info/
+
+# ===== Node =====
+node_modules/
+backend/node_modules/
+
+# ===== Logs =====
+*.log
+
+# ===== OS =====
+.DS_Store
