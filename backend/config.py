@@ -1,10 +1,18 @@
 import os
 from dotenv import load_dotenv
-
+from urllib.parse import quote_plus
 # Load .env
 load_dotenv()
-MONGO_URI = "mongodb://localhost:27017"
+MONGO_USER = "admin"
+MONGO_PASSWORD = quote_plus("admin@123")   # 👈 encode ở đây
+MONGO_HOST = "cluster0.orutwwp.mongodb.net"
 MONGO_DB = "data"
+
+MONGO_URI = (
+    f"mongodb+srv://{MONGO_USER}:{MONGO_PASSWORD}"
+    f"@{MONGO_HOST}/{MONGO_DB}"
+)
+MONGO_COL_MITRE = "mitre_results"
 MONGO_COL_IOC = "IOC"
 MONGO_COL_RULE_SETS = "rule_sets"
 MONGO_COL_RULES = "rules"
