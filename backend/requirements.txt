@@ -1,12 +1,15 @@
-# Web framework
+# Web framework & APIs
 Flask>=2.3
-
-# Gọi API HTTP
+Flask-Cors>=4.0
 requests>=2.30
-
-# Load bien môi trường từ .env
 python-dotenv>=1.0
 
-# MongoDB (nếu dùng save_to_mongo)
+# Database
 pymongo>=4.5
+
+# AI & MITRE ATT&CK Classification
+joblib>=1.3
+catboost>=1.2
+numpy>=1.24
+scikit-learn>=1.3
 
