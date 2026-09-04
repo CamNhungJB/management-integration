@@ -15,7 +15,6 @@
 - Centralized security log collection
 - Security event normalization
 - IDS/IPS monitoring using Snort
-- SIEM using OpenSearch
 - Threat Intelligence enrichment
 - IOC collection from ThreatFox and AbuseIPDB
 - Automated Snort rule generation
