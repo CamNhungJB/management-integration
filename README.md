@@ -22,3 +22,23 @@
 - MITRE ATT&CK behavior mapping
 - AI-assisted attack correlation
 - SOC monitoring dashboard
+
+## 🚀 Hướng dẫn cài đặt & Khởi chạy
+
+### 1. Kích hoạt môi trường ảo (Virtual Environment)
+# Windows
+```bash
+python -m venv venv
+venv\Scripts\activate
+```
+
+# Linux / macOS
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+### 2. Kích hoạt môi trường ảo (Virtual Environment)
+```
+pip install --upgrade pip
+pip install -r requirements.txt
+```
